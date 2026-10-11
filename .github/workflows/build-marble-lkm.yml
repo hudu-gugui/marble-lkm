@@ -1,0 +1,85 @@
+# 针对 Glow Kernel (5.10.271-Glow-v5.2 / Melt-marble-v5.2) 编译 SUSFS LKM
+# 不需要 fork 原仓库：内核源码与模块源码都由 CI 自己拉取
+name: build-marble-lkm
+
+on:
+  workflow_dispatch:
+  push:
+    paths-ignore:
+      - "**.md"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # 复用模块官方 CI 的同一套工具链镜像（内含 clang r416183b，与 Glow 要求一致）
+    container:
+      image: ghcr.io/ylarod/ddk-min:android12-5.10-20260828
+      options: --privileged
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 准备 device.config
+        run: |
+          set -e
+          if [ ! -f device.config ]; then
+            echo "仓库内无 device.config，从临时链接获取（30 天有效）"
+            curl -fsSL "https://dpaste.com/HVGF8QGYW.txt" -o device.config
+          fi
+          echo "config 行数: $(wc -l < device.config)"
+          grep -E '^CONFIG_LSM=|^CONFIG_LOCALVERSION=|^CONFIG_CFI_CLANG=' device.config || true
+
+      - name: 克隆 Glow/Melt 内核源码 (v5.2)
+        run: |
+          set -e
+          git clone --depth 1 -b Melt-marble-v5.2 \
+            https://github.com/Pzqqt/android_kernel_xiaomi_marble.git /tmp/marble
+
+      - name: 克隆 SUSFS 模块源码
+        run: |
+          set -e
+          git clone --depth 1 https://github.com/inforcqb/susfs4ksu-lkm.git /tmp/lkm
+
+      - name: 用设备 config 准备内核头文件
+        run: |
+          set -e
+          cd /tmp/marble
+          mkdir -p out
+          cp "$GITHUB_WORKSPACE/device.config" out/.config
+          make O=out ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 olddefconfig
+          echo "=== 核对实际使用的 LSM 配置（应与设备一致） ==="
+          grep -E '^CONFIG_LSM=|^CONFIG_SECURITY_LANDLOCK' out/.config || true
+          make O=out ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 modules_prepare -j"$(nproc)"
+
+      - name: 编译 susfs_guard_lkm.ko
+        run: |
+          set -e
+          clang --version | head -1
+          make -k -C /tmp/marble O=/tmp/marble/out M=/tmp/lkm/kernel \
+               ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 modules -j"$(nproc)"
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          cp /tmp/lkm/kernel/susfs_guard_lkm.ko \
+             "$GITHUB_WORKSPACE/out/susfs_guard_lkm-android12-5.10.ko"
+          ls -la "$GITHUB_WORKSPACE/out/"
+          modinfo "$GITHUB_WORKSPACE/out/susfs_guard_lkm-android12-5.10.ko" 2>/dev/null | grep -E "vermagic|name" || true
+
+      - name: 上传 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: susfs_guard_lkm-android12-5.10
+          path: out/susfs_guard_lkm-android12-5.10.ko
+
+      - name: 提交产物回仓库（便于直接下载）
+        continue-on-error: true
+        run: |
+          set -e
+          cd "$GITHUB_WORKSPACE"
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -f device.config out/
+          git commit -m "build: susfs_guard_lkm-android12-5.10 [skip ci]" || echo "nothing to commit"
+          git push
