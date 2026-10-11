@@ -1,5 +1,5 @@
 # 针对 Glow Kernel (5.10.271-Glow-v5.2 / Melt-marble-v5.2) 编译 SUSFS LKM
-# 不需要 fork 原仓库：内核源码与模块源码都由 CI 自己拉取
+# v2：自动安装编译依赖 + 全量日志回传（失败也能看到原因）
 name: build-marble-lkm
 
 on:
@@ -14,7 +14,6 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    # 复用模块官方 CI 的同一套工具链镜像（内含 clang r416183b，与 Glow 要求一致）
     container:
       image: ghcr.io/ylarod/ddk-min:android12-5.10-20260828
       options: --privileged
@@ -23,63 +22,100 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: 环境诊断
+        run: |
+          echo "--- os ---"; head -3 /etc/os-release 2>/dev/null || true
+          echo "--- tools ---"
+          for t in make gcc clang ld.lld llvm-ar llvm-nm python3 bc flex bison dpkg; do
+            printf '%-10s %s\n' "$t" "$(command -v $t || echo MISSING)"
+          done
+          echo "--- clang ---"; clang --version 2>/dev/null | head -1 || true
+          echo "--- disk ---"; df -h / /tmp 2>/dev/null || df -h
+          echo "GITHUB_WORKSPACE=$GITHUB_WORKSPACE"
+
       - name: 准备 device.config
         run: |
           set -e
           if [ ! -f device.config ]; then
-            echo "仓库内无 device.config，从临时链接获取（30 天有效）"
+            echo "仓库内无 device.config，从临时链接获取"
             curl -fsSL "https://dpaste.com/HVGF8QGYW.txt" -o device.config
           fi
           echo "config 行数: $(wc -l < device.config)"
-          grep -E '^CONFIG_LSM=|^CONFIG_LOCALVERSION=|^CONFIG_CFI_CLANG=' device.config || true
 
-      - name: 克隆 Glow/Melt 内核源码 (v5.2)
+      - name: 克隆 Glow/Melt 内核源码 与 模块源码
         run: |
           set -e
           git clone --depth 1 -b Melt-marble-v5.2 \
             https://github.com/Pzqqt/android_kernel_xiaomi_marble.git /tmp/marble
-
-      - name: 克隆 SUSFS 模块源码
-        run: |
-          set -e
           git clone --depth 1 https://github.com/inforcqb/susfs4ksu-lkm.git /tmp/lkm
 
-      - name: 用设备 config 准备内核头文件
+      - name: 安装内核编译依赖（尽力而为）
+        continue-on-error: true
         run: |
-          set -e
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq || true
+          apt-get install -y -qq --no-install-recommends \
+            libssl-dev libelf-dev bc flex bison cpio kmod zstd ca-certificates || true
+          echo "libssl:"; ls /usr/include/openssl/bio.h 2>/dev/null || echo "  openssl header MISSING"
+
+      - name: 准备内核头文件
+        continue-on-error: true
+        run: |
           cd /tmp/marble
           mkdir -p out
           cp "$GITHUB_WORKSPACE/device.config" out/.config
-          make O=out ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 olddefconfig
-          echo "=== 核对实际使用的 LSM 配置（应与设备一致） ==="
-          grep -E '^CONFIG_LSM=|^CONFIG_SECURITY_LANDLOCK' out/.config || true
-          make O=out ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 modules_prepare -j"$(nproc)"
+          {
+            echo "===== olddefconfig ====="
+            make O=out ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 olddefconfig
+            echo "rc=$?"
+            echo "===== config 核对 ====="
+            grep -E '^CONFIG_LSM=|^CONFIG_SECURITY_LANDLOCK|^CONFIG_LOCALVERSION=' out/.config
+            echo "===== modules_prepare ====="
+            make O=out ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 modules_prepare -j"$(nproc)"
+            echo "rc=$?"
+          } > /tmp/prepare.log 2>&1
+          tail -n 60 /tmp/prepare.log
+          cp /tmp/prepare.log "$GITHUB_WORKSPACE/prepare.log"
 
       - name: 编译 susfs_guard_lkm.ko
-        run: |
-          set -e
-          clang --version | head -1
-          make -k -C /tmp/marble O=/tmp/marble/out M=/tmp/lkm/kernel \
-               ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 modules -j"$(nproc)"
-          mkdir -p "$GITHUB_WORKSPACE/out"
-          cp /tmp/lkm/kernel/susfs_guard_lkm.ko \
-             "$GITHUB_WORKSPACE/out/susfs_guard_lkm-android12-5.10.ko"
-          ls -la "$GITHUB_WORKSPACE/out/"
-          modinfo "$GITHUB_WORKSPACE/out/susfs_guard_lkm-android12-5.10.ko" 2>/dev/null | grep -E "vermagic|name" || true
-
-      - name: 上传 artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: susfs_guard_lkm-android12-5.10
-          path: out/susfs_guard_lkm-android12-5.10.ko
-
-      - name: 提交产物回仓库（便于直接下载）
         continue-on-error: true
         run: |
-          set -e
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          {
+            echo "===== build module ====="
+            clang --version | head -1
+            make -k -C /tmp/marble O=/tmp/marble/out M=/tmp/lkm/kernel \
+                 ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 modules -j"$(nproc)"
+            echo "rc=$?"
+            ls -la /tmp/lkm/kernel/*.ko 2>/dev/null || true
+          } > /tmp/build.log 2>&1
+          tail -n 60 /tmp/build.log
+          cp /tmp/build.log "$GITHUB_WORKSPACE/build.log"
+          if [ -f /tmp/lkm/kernel/susfs_guard_lkm.ko ]; then
+            cp /tmp/lkm/kernel/susfs_guard_lkm.ko \
+               "$GITHUB_WORKSPACE/out/susfs_guard_lkm-android12-5.10.ko"
+          fi
+          ls -la "$GITHUB_WORKSPACE/out/" 2>/dev/null || true
+
+      - name: 上传 artifact（日志 + 成品）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-and-ko
+          path: |
+            out/susfs_guard_lkm-android12-5.10.ko
+            prepare.log
+            build.log
+          if-no-files-found: warn
+
+      - name: 提交日志与产物回仓库
+        if: always()
+        continue-on-error: true
+        run: |
           cd "$GITHUB_WORKSPACE"
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -f device.config out/
-          git commit -m "build: susfs_guard_lkm-android12-5.10 [skip ci]" || echo "nothing to commit"
-          git push
+          [ -f device.config ] || curl -fsSL "https://dpaste.com/HVGF8QGYW.txt" -o device.config || true
+          git add -f device.config prepare.log build.log out/ || true
+          git commit -m "build: logs+ko [skip ci]" || echo "nothing to commit"
+          git push || true
